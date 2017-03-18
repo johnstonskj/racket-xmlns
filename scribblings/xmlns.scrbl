@@ -1,5 +1,5 @@
 #lang scribble/manual
-@(require (for-label "../main.rkt"
+@(require (for-label "../xml/ns.rkt"
                      xml))
 
 @title{XML Namespace Resolver}
@@ -7,7 +7,7 @@
 This package extends the XML reader to extract namespace information
 from XML elements and attributes.
 
-@defmodule[xmlns]
+@defmodule[xml/ns]
 
 @defproc[(attribute-name-prefix [att attribute?])
          (or/c symbol? #f)]{
