@@ -3,6 +3,29 @@
 (require racket/contract/base
          xml)
 
+(provide
+ (contract-out
+  [attribute-name-prefix (-> attribute? (or/c #f symbol?))]
+  [attribute-namespace (-> attribute? (or/c #f string?))]
+  [element-name-prefix (-> element? (or/c #f symbol?))]
+  [element-namespace (-> element? (or/c #f string?))]
+  [xml-expand-names (-> document? document?)]
+  [xml-expand-names/content (->* (content/c)
+                                 ((hash/c (or/c #f symbol?)
+                                          (or/c #f string?)
+                                          #:flat? #t))
+                                 content/c)])
+ (struct-out exn:fail:xmlns))
+
+(struct exn:fail:xmlns exn:fail (element))
+
+(define (raise-xmlns-error element form . vs)
+  (raise
+   (exn:fail:xmlns
+    (apply format form vs)
+    (current-continuation-marks)
+    element)))
+
 (define-values (prop:name-prefix has-name-prefix? get-name-prefix)
   (make-impersonator-property 'name-prefix))
 
@@ -21,16 +44,21 @@
 (define (element-namespace elt)
   (and (has-namespace? elt) (get-namespace elt)))
 
-(define (expand-names doc)
+(define (xml-expand-names doc)
   (struct-copy document doc
-               [element (expand-names/content (document-element doc))]))
+               [element (xml-expand-names/content (document-element doc))]))
 
-(define (expand-names/content content [namespaces (hasheq #f #f)])
-  (expand-names/content/cache content namespaces (make-hasheq)))
+(define (xml-expand-names/content content [namespaces (hasheq #f #f)])
+  (xml-expand-names/content/cache content namespaces (make-hasheq)))
 
-(define (expand-names/content/cache content namespaces name-cache)
-  (define (get-ns namespaces ns-name)
-    (hash-ref namespaces ns-name (λ () (error "unknown namespace:" ns-name))))
+(define (xml-expand-names/content/cache content namespaces name-cache)
+  (cond
+    [(element? content) (xml-expand-names/element/cache content namespaces name-cache)]
+    [else content]))
+
+(define (xml-expand-names/element/cache elt namespaces name-cache)
+  (define (ns-ref namespaces ns-name)
+    (hash-ref namespaces ns-name (λ () (raise-xmlns-error elt "undeclared prefix: ~a" ns-name))))
   (define (split-name name)
     (define ns+base
       (hash-ref! name-cache
@@ -43,67 +71,63 @@
                            (define ns-name (list-ref m 2))
                            (cons (and ns-name (string->symbol ns-name))
                                  (string->symbol (list-ref m 3))))]
-                     [else (error "invalid name:" name)]))))
+                     [else (raise-xmlns-error elt "invalid name: ~a" name)]))))
     (values (car ns+base) (cdr ns+base)))
-  (cond
-    [(element? content)
-     (define elt content)
-     (define elt-namespaces
-       (for/fold ([namespaces namespaces])
-                 ([att (in-list (element-attributes elt))])
-         (define-values (ns-name base-name)
-           (split-name (attribute-name att)))
-         (if (eq? (or ns-name base-name) 'xmlns)
-             (let ([ns (attribute-value att)])
-               (hash-set namespaces
-                         (and ns-name base-name)
-                         (if (equal? "" ns) #f ns)))
-             namespaces)))
-     (define-values (elt-ns-name elt-type)
-       (split-name (element-name elt)))
-     (define elt-ns (get-ns elt-namespaces elt-ns-name))
-     (define expanded-atts
-       (for/list ([att (in-list (element-attributes elt))])
-         (define-values (ns-name base-name)
-           (split-name (attribute-name att)))
-         (if (eq? (or ns-name base-name) 'xmlns)
-             att
-             (chaperone-struct
-              (struct-copy attribute att
-                           [name base-name])
-              struct:attribute
-              prop:name-prefix ns-name
-              prop:namespace (and ns-name (get-ns elt-namespaces ns-name))))))
-     (define expanded-content
-       (for/list ([content (in-list (element-content elt))])
-         (expand-names/content/cache content elt-namespaces name-cache)))
-     (chaperone-struct
-      (struct-copy element elt
-                   [name elt-type]
-                   [attributes expanded-atts]
-                   [content expanded-content])
-      struct:element
-      prop:name-prefix elt-ns-name
-      prop:namespace elt-ns)]
-    [else content]))
-
-(provide/contract
- [attribute-name-prefix (-> attribute? (or/c #f symbol?))]
- [attribute-namespace (-> attribute? (or/c #f string?))]
- [element-name-prefix (-> element? (or/c #f symbol?))]
- [element-namespace (-> element? (or/c #f string?))]
- [expand-names (-> document? document?)]
- [expand-names/content (->* (content/c)
-                            ((hash/c (or/c #f symbol?)
-                                     (or/c #f string?)
-                                     #:flat? #t))
-                            content/c)])
+  (define elt-namespaces
+    (for/fold ([namespaces namespaces])
+              ([att (in-list (element-attributes elt))])
+      (define-values (ns-name base-name)
+        (split-name (attribute-name att)))
+      (if (eq? (or ns-name base-name) 'xmlns)
+          (let ([ns (attribute-value att)])
+            (hash-set namespaces
+                      (and ns-name base-name)
+                      (if (equal? "" ns)
+                          (begin
+                            (unless (not ns-name)
+                              (raise-xmlns-error elt "empty namespace declaration"))
+                            #f)
+                          ns)))
+          namespaces)))
+  (define-values (elt-ns-name elt-type)
+    (split-name (element-name elt)))
+  (define elt-ns (ns-ref elt-namespaces elt-ns-name))
+  (define expanded-atts
+    (for/list ([att (in-list (element-attributes elt))])
+      (define-values (ns-name base-name)
+        (split-name (attribute-name att)))
+      (if (eq? (or ns-name base-name) 'xmlns)
+          att
+          (chaperone-struct
+           (struct-copy attribute att
+                        [name base-name])
+           struct:attribute
+           prop:name-prefix ns-name
+           prop:namespace (and ns-name (ns-ref elt-namespaces ns-name))))))
+  (for/fold ([checked-attributes (hasheq)])
+            ([att (in-list expanded-atts)])
+    (define att-name (attribute-name att))
+    (define att-ns (attribute-namespace att))
+    (when (and att-ns (equal? att-ns (hash-ref checked-attributes att-name #f)))
+      (raise-xmlns-error elt "duplicate attribute: ~a" att-name))
+    (hash-set checked-attributes att-name att-ns))
+  (define expanded-content
+    (for/list ([content (in-list (element-content elt))])
+      (xml-expand-names/content/cache content elt-namespaces name-cache)))
+  (chaperone-struct
+   (struct-copy element elt
+                [name elt-type]
+                [attributes expanded-atts]
+                [content expanded-content])
+   struct:element
+   prop:name-prefix elt-ns-name
+   prop:namespace elt-ns))
 
 (module+ test
   (require rackunit)
   (define (extract-meta str)
     (define doc
-      (expand-names
+      (xml-expand-names
        (read-xml (open-input-string str))))
     (let next-elt ([e (document-element doc)])
       (list
@@ -118,53 +142,153 @@
        (for/list ([c (element-content e)]
                   #:when (element? c))
          (next-elt c)))))
-  (define doc1
-#<<END
-<section xmlns='urn:com:books-r-us'>
-  <title>Book-Signing Event</title>
-  <signing>
-    <author title="Mr" name="Vikram Seth" />
-    <book title="A Suitable Boy" price="$22.95" />
-  </signing>
-</section>
+  (check-exn
+   exn:fail:xmlns?
+   (λ () (extract-meta "<:x />")))
+  (check-exn
+   exn:fail:xmlns?
+   (λ () (extract-meta "<x: xmlns:x='http://a.example.com/schema' />")))
+  (check-exn
+   exn:fail:xmlns?
+   (λ () (extract-meta "<: />")))
+  (check-exn
+   exn:fail:xmlns?
+   (λ () (extract-meta "<a:b:c xmlns:a='http://a.example.com/schema' xmlns:b='http://b.example.com/schema' />")))
+  (check-exn
+   exn:fail:xmlns?
+   (λ () (extract-meta "<unknown:x />")))
+  (check-equal?
+   (extract-meta "<x xmlns='' />")
+   '(#f x #f () ()))
+  (check-exn
+   exn:fail:xmlns?
+   (λ () (extract-meta "<x xmlns:undeclare='' />")))
+  (check-equal?
+   (extract-meta #<<END
+<html:html xmlns:html='http://www.w3.org/1999/xhtml'>
+  <html:head><html:title>Frobnostication</html:title></html:head>
+  <html:body><html:p>Moved to 
+    <html:a href='http://frob.example.com'>here.</html:a></html:p></html:body>
+</html:html>
 END
-    )
-  (define doc1-meta
-    '(#f section "urn:com:books-r-us"
-         ()
-         ((#f title "urn:com:books-r-us" () ())
-          (#f signing "urn:com:books-r-us"
-              ()
-              ((#f author "urn:com:books-r-us"
-                   ((#f title #f)
-                    (#f name #f))
-                   ())
-               (#f book "urn:com:books-r-us"
-                   ((#f title #f)
-                    (#f price #f))
-                   ()))))))
-  (define doc2
-#<<END
-<RESERVATION xmlns:HTML="http://www.w3.org/TR/REC-html40">
-<NAME HTML:CLASS="largeSansSerif">Layman, A</NAME>
-<SEAT CLASS="Y" HTML:CLASS="largeMonotype">33B</SEAT>
-<HTML:A HREF='/cgi-bin/ResStatus'>Check Status</HTML:A>
-<DEPARTURE>1997-05-24T07:55:00+1</DEPARTURE></RESERVATION>
+)
+   '(html html "http://www.w3.org/1999/xhtml"
+          ()
+          ((html head "http://www.w3.org/1999/xhtml"
+                 ()
+                 ((html title "http://www.w3.org/1999/xhtml" () ())))
+           (html body "http://www.w3.org/1999/xhtml"
+                 ()
+                 ((html p "http://www.w3.org/1999/xhtml"
+                        ()
+                        ((html a "http://www.w3.org/1999/xhtml"
+                               ((#f href #f))
+                               ()))))))))
+  (check-equal?
+   (extract-meta #<<END
+<bk:book xmlns:bk='urn:loc.gov:books'
+         xmlns:isbn='urn:ISBN:0-395-36341-6'>
+    <bk:title>Cheaper by the Dozen</bk:title>
+    <isbn:number>1568491379</isbn:number>
+</bk:book>
 END
-    )
-  (define doc2-meta
-    '(#f RESERVATION #f
-         ()
-         ((#f NAME #f
-              ((HTML CLASS "http://www.w3.org/TR/REC-html40"))
-              ())
-          (#f SEAT #f
-              ((#f CLASS #f)
-               (HTML CLASS "http://www.w3.org/TR/REC-html40"))
-              ())
-          (HTML A "http://www.w3.org/TR/REC-html40"
-                ((#f HREF #f))
-                ())
-          (#f DEPARTURE #f () ()))))
-  (check-equal? (extract-meta doc1) doc1-meta)
-  (check-equal? (extract-meta doc2) doc2-meta))
+)
+   '(bk book "urn:loc.gov:books"
+        ()
+        ((bk title "urn:loc.gov:books" () ())
+         (isbn number "urn:ISBN:0-395-36341-6" () ()))))
+  (check-equal?
+   (extract-meta #<<END
+<book xmlns='urn:loc.gov:books'
+      xmlns:isbn='urn:ISBN:0-395-36341-6'>
+    <title>Cheaper by the Dozen</title>
+    <isbn:number>1568491379</isbn:number>
+    <notes>
+      <p xmlns='http://www.w3.org/1999/xhtml'>
+          This is a <i>funny</i> book!
+      </p>
+    </notes>
+</book>
+END
+)
+   '(#f book "urn:loc.gov:books"
+        ()
+        ((#f title "urn:loc.gov:books" () ())
+         (isbn number "urn:ISBN:0-395-36341-6" () ())
+         (#f notes "urn:loc.gov:books"
+             ()
+             ((#f p "http://www.w3.org/1999/xhtml"
+                  ()
+                  ((#f i "http://www.w3.org/1999/xhtml" () ()))))))))
+  (check-equal?
+   (extract-meta #<<END
+<Beers>
+  <table xmlns='http://www.w3.org/1999/xhtml'>
+   <th><td>Name</td><td>Origin</td><td>Description</td></th>
+   <tr> 
+     <td><brandName xmlns="">Huntsman</brandName></td>
+     <td><origin xmlns="">Bath, UK</origin></td>
+     <td>
+       <details xmlns=""><class>Bitter</class><hop>Fuggles</hop>
+         <pro>Wonderful hop, light alcohol, good summer beer</pro>
+         <con>Fragile; excessive variance pub to pub</con>
+         </details>
+        </td>
+      </tr>
+    </table>
+  </Beers>
+END
+)
+   '(#f Beers #f
+        ()
+        ((#f table "http://www.w3.org/1999/xhtml"
+             ()
+             ((#f th "http://www.w3.org/1999/xhtml"
+                  ()
+                  ((#f td "http://www.w3.org/1999/xhtml" () ())
+                   (#f td "http://www.w3.org/1999/xhtml" () ())
+                   (#f td "http://www.w3.org/1999/xhtml" () ())))
+              (#f tr "http://www.w3.org/1999/xhtml"
+                  ()
+                  ((#f td "http://www.w3.org/1999/xhtml"
+                       ()
+                       ((#f brandName #f () ())))
+                   (#f td "http://www.w3.org/1999/xhtml"
+                       ()
+                       ((#f origin #f () ())))
+                   (#f td "http://www.w3.org/1999/xhtml"
+                       ()
+                       ((#f details #f
+                            ()
+                            ((#f class #f () ())
+                             (#f hop #f () ())
+                             (#f pro #f () ())
+                             (#f con #f () ()))))))))))))
+  (check-exn
+   exn:fail:xmlns?
+   (λ () (extract-meta #<<END
+<x xmlns:n1="http://www.w3.org" 
+   xmlns:n2="http://www.w3.org" >
+  <bad n1:a="1"  n2:a="2" />
+</x>
+END
+)))
+  (check-equal?
+   (extract-meta #<<END
+<x xmlns:n1="http://www.w3.org" 
+   xmlns="http://www.w3.org" >
+  <good a="1"     b="2" />
+  <good a="1"     n1:a="2" />
+</x>
+END
+)
+   '(#f x "http://www.w3.org"
+        ()
+        ((#f good "http://www.w3.org"
+             ((#f a #f)
+              (#f b #f))
+             ())
+         (#f good  "http://www.w3.org"
+             ((#f a #f)
+              (n1 a "http://www.w3.org"))
+             ())))))
