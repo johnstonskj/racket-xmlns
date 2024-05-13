@@ -17,6 +17,41 @@
                                  content/c)])
  (struct-out exn:fail:xmlns))
 
+;; According to https://www.w3.org/TR/REC-xml-names/:
+;; The prefix xml is by definition bound to the namespace name
+;; http://www.w3.org/XML/1998/namespace. It MAY, but need not, be declared, and
+;; MUST NOT be bound to any other namespace name. Other prefixes MUST NOT be
+;; bound to this namespace name, and it MUST NOT be declared as the default
+;; namespace.
+;;
+;; The prefix xmlns is used only to declare namespace bindings and is by
+;; definition bound to the namespace name http://www.w3.org/2000/xmlns/. It
+;; MUST NOT be declared . Other prefixes MUST NOT be bound to this namespace
+;; name, and it MUST NOT be declared as the default namespace. Element names
+;; MUST NOT have the prefix xmlns.
+;;
+;; All other prefixes beginning with the three-letter sequence x, m, l, in any
+;; case combination, are reserved. This means that:
+;;
+;; - users SHOULD NOT use them except as defined by later specifications
+;; - processors MUST NOT treat them as fatal errors.
+;;
+(define xml-namespace-url "http://www.w3.org/XML/1998/namespace")
+
+(define (default-namespace-cache)
+  (hasheq #f #f 'xml (string->symbol xml-namespace-url)))
+
+;; From https://www.w3.org/TR/xml11:
+;;
+;; xml:base -- https://www.w3.org/TR/xmlbase/
+;; xml:lang -- section 2.12 Language Identification
+;; xml:space -- section 2.10 White Space Handling
+;;
+(define (default-name-cache)
+  (make-hasheq '((xml:base . (xml . base))
+                 (xml:lang . (xml . lang))
+                 (xml:space . (xml . space)))))
+
 (struct exn:fail:xmlns exn:fail (element))
 
 (define (raise-xmlns-error element form . vs)
@@ -48,8 +83,8 @@
   (struct-copy document doc
                [element (xml-expand-names/content (document-element doc))]))
 
-(define (xml-expand-names/content content [namespaces (hasheq #f #f)])
-  (xml-expand-names/content/cache content namespaces (make-hasheq)))
+(define (xml-expand-names/content content [namespaces (default-namespace-cache)])
+  (xml-expand-names/content/cache content namespaces (default-name-cache)))
 
 (define (xml-expand-names/content/cache content namespaces name-cache)
   (cond
@@ -80,6 +115,15 @@
         (split-name (attribute-name att)))
       (if (eq? (or ns-name base-name) 'xmlns)
           (let ([ns (attribute-value att)])
+            (when (or
+                 (and (string-ci=? (symbol->string base-name) "xml")
+                      (not (string=? ns xml-namespace-url)))
+                 (and (string=? ns xml-namespace-url)
+                      (not (string-ci=? (symbol->string base-name) "xml"))))
+              (raise-xmlns-error elt
+                                 (format "illegal to redefine xml namespace (~a = ~a)"
+                                         base-name
+                                         ns)))
             (hash-set namespaces
                       (and ns-name base-name)
                       (if (equal? "" ns)
@@ -291,4 +335,13 @@ END
          (#f good  "http://www.w3.org"
              ((#f a #f)
               (n1 a "http://www.w3.org"))
-             ())))))
+          ()))))
+  (check-equal?
+   (extract-meta "<foo xml:lang=\"en\"></foo>")
+   '(#f foo #f ((xml lang http://www.w3.org/XML/1998/namespace)) ()))
+  (check-exn
+   exn:fail:xmlns?
+   (λ () (extract-meta "<foo xmlns:xml=\"http://example.org/xml\"></foo>")))
+  (check-exn
+   exn:fail:xmlns?
+   (λ () (extract-meta "<foo xmlns:other=\"http://www.w3.org/XML/1998/namespace\"></foo>"))))
