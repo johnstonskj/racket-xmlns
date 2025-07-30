@@ -39,7 +39,7 @@
 (define xml-namespace-url "http://www.w3.org/XML/1998/namespace")
 
 (define (default-namespace-cache)
-  (hasheq #f #f 'xml (string->symbol xml-namespace-url)))
+  (hasheq #f #f 'xml xml-namespace-url))
 
 ;; From https://www.w3.org/TR/xml11:
 ;;
